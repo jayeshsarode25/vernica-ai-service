@@ -7,6 +7,12 @@ const {
   getBeautyAssistantReply,
 } = require("../services/gemini.service");
 
+const MAX_MESSAGE_LENGTH = 500;
+const RATE_LIMIT_WINDOW_MS = 10000;
+const RATE_LIMIT_MAX_MESSAGES = 5;
+const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
+const SESSION_CLEANUP_MS = 60 * 60 * 1000;
+
 const CONTACT_KEYWORDS = [
   "order",
   "buy",
@@ -41,23 +47,25 @@ const CONTACT_KEYWORDS = [
   "सहाय्य",
 ];
 
-const sessionState = {};
+const socketRateLimits = new Map();
+const sessionStates = new Map();
+
+const sessionCleanupTimer = setInterval(() => {
+  const now = Date.now();
+
+  for (const [sessionId, state] of sessionStates) {
+    if (now - state.lastActive > SESSION_TTL_MS) {
+      sessionStates.delete(sessionId);
+    }
+  }
+}, SESSION_CLEANUP_MS);
+
+sessionCleanupTimer.unref?.();
 
 const getContactInfo = () => ({
   inquiryNumber: process.env.INQUIRY_NUMBER || "+91XXXXXXXXXX",
   whatsappNumber: process.env.WHATSAPP_NUMBER || "+91XXXXXXXXXX",
 });
-
-const getContactMessage = ({ inquiryNumber, whatsappNumber }) =>
-  [
-    "Thank you for sharing your details 💗",
-    "For personal guidance and order inquiry, you can contact our Vernika beauty expert:",
-    "",
-    `📞 Inquiry Number: ${inquiryNumber}`,
-    `💬 WhatsApp: ${whatsappNumber}`,
-    "",
-    "You can also share your name, skin concern, and preferred product here, and our team will help you.",
-  ].join("\n");
 
 const shouldShareContactNow = (text) => {
   const normalizedText = text.toLowerCase();
@@ -75,35 +83,71 @@ const normalizePayload = (payload) => {
   return payload || {};
 };
 
+const isRateLimited = (socketId) => {
+  const now = Date.now();
+  const timestamps = (socketRateLimits.get(socketId) || []).filter(
+    (timestamp) => now - timestamp < RATE_LIMIT_WINDOW_MS,
+  );
+
+  if (timestamps.length >= RATE_LIMIT_MAX_MESSAGES) {
+    socketRateLimits.set(socketId, timestamps);
+    return true;
+  }
+
+  timestamps.push(now);
+  socketRateLimits.set(socketId, timestamps);
+  return false;
+};
+
+const getSessionState = (sessionId) => {
+  return (
+    sessionStates.get(sessionId) || {
+      messageCount: 0,
+      contactShared: false,
+      lastActive: Date.now(),
+    }
+  );
+};
+
 const registerChatSocket = (io) => {
   io.on("connection", (socket) => {
     console.log(`Socket connected: ${socket.id}`);
-
-    sessionState[socket.id] = {
-      messageCount: 0,
-      contactShared: false,
-    };
 
     socket.on("user_message", async (payload) => {
       const { message, sessionId: payloadSessionId } = normalizePayload(payload);
       const text = typeof message === "string" ? message.trim() : "";
       const sessionId = payloadSessionId || socket.id;
-      const state = sessionState[socket.id] || {
-        messageCount: 0,
-        contactShared: false,
-      };
 
       if (!text) {
         socket.emit("chat_error", {
           success: false,
-          message: "Message is required",
+          message: "Message cannot be empty.",
         });
         return;
       }
 
+      if (text.length > MAX_MESSAGE_LENGTH) {
+        socket.emit("chat_error", {
+          success: false,
+          message: `Message cannot exceed ${MAX_MESSAGE_LENGTH} characters.`,
+        });
+        return;
+      }
+
+      if (isRateLimited(socket.id)) {
+        socket.emit("chat_error", {
+          success: false,
+          message: "You are sending messages too quickly. Please wait a moment.",
+        });
+        return;
+      }
+
+      const state = getSessionState(sessionId);
+
       try {
         state.messageCount += 1;
-        sessionState[socket.id] = state;
+        state.lastActive = Date.now();
+        sessionStates.set(sessionId, state);
 
         const history = await getRecentMessages(sessionId);
 
@@ -127,22 +171,20 @@ const registerChatSocket = (io) => {
 
         const contactInfo = getContactInfo();
         const isContactRequest = shouldShareContactNow(text);
-        const shouldAppendContact =
+        const shouldShareContact =
           !state.contactShared && (isContactRequest || state.messageCount >= 5);
-        const finalReply = shouldAppendContact
-          ? `${reply}\n\n${getContactMessage(contactInfo)}`
-          : reply;
 
-        if (shouldAppendContact) {
+        if (shouldShareContact) {
           state.contactShared = true;
-          sessionState[socket.id] = state;
+          state.lastActive = Date.now();
+          sessionStates.set(sessionId, state);
         }
 
         const savedReply = await saveMessage({
           sessionId,
           socketId: socket.id,
           sender: "bot",
-          text: finalReply,
+          text: reply,
         });
 
         socket.emit("bot_typing", {
@@ -155,11 +197,11 @@ const registerChatSocket = (io) => {
           success: true,
           sessionId,
           botName: BOT_NAME,
-          message: finalReply,
+          message: reply,
           createdAt: savedReply.createdAt,
         });
 
-        if (shouldAppendContact) {
+        if (shouldShareContact) {
           socket.emit("contact_info", {
             success: true,
             sessionId,
@@ -181,14 +223,17 @@ const registerChatSocket = (io) => {
         socket.emit("chat_error", {
           success: false,
           sessionId,
-          message: "Vernika Beauty Assistant is unavailable right now. Please try again shortly.",
+          message:
+            error.name === "AbortError"
+              ? "Response took too long. Please try again."
+              : "Vernika Beauty Assistant is temporarily unavailable. Please try again in a moment.",
         });
       }
     });
 
     socket.on("disconnect", () => {
       console.log(`Socket disconnected: ${socket.id}`);
-      delete sessionState[socket.id];
+      socketRateLimits.delete(socket.id);
     });
   });
 };

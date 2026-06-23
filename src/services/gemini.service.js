@@ -4,6 +4,7 @@ const {
 } = require("../config/gemini");
 
 const BOT_NAME = "Vernika Beauty Assistant";
+const GEMINI_TIMEOUT_MS = 30000;
 
 const SYSTEM_PROMPT = `
 You are Vernika Beauty Assistant, a helpful AI assistant for Vernika beauty and organic skincare website.
@@ -97,14 +98,24 @@ const buildRequestBody = ({ message, history }) => ({
 });
 
 const requestGeminiReply = async ({ apiKey, model, message, history }) => {
-  const response = await fetch(getGeminiGenerateContentUrl(model), {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-goog-api-key": apiKey,
-    },
-    body: JSON.stringify(buildRequestBody({ message, history })),
-  });
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
+
+  let response;
+
+  try {
+    response = await fetch(getGeminiGenerateContentUrl(model), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-goog-api-key": apiKey,
+      },
+      body: JSON.stringify(buildRequestBody({ message, history })),
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeoutId);
+  }
 
   const responseBody = await response.json().catch(() => ({}));
 
