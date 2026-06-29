@@ -206,7 +206,7 @@ const registerChatSocket = (io) => {
             success: true,
             sessionId,
             botName: BOT_NAME,
-            message: "Talk to Vernika beauty expert",
+            message: "Talk to Varnika beauty expert",
             inquiryNumber: contactInfo.inquiryNumber,
             whatsappNumber: contactInfo.whatsappNumber,
           });
@@ -226,7 +226,7 @@ const registerChatSocket = (io) => {
           message:
             error.name === "AbortError"
               ? "Response took too long. Please try again."
-              : "Vernika Beauty Assistant is temporarily unavailable. Please try again in a moment.",
+              : "Varnika Beauty Assistant is temporarily unavailable. Please try again in a moment.",
         });
       }
     });
